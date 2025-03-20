@@ -17,7 +17,7 @@
     "自动合并",
     "分支管理"
   ],
-  "icon": "images/icon.png",
+  "icon": "resources/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/你的用户名/merge-branch-helper.git"
