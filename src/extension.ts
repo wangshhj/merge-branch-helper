@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { exec } from 'child_process';
+import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
@@ -10,9 +10,67 @@ let outputChannel: vscode.OutputChannel;
 // 存储上次选择的分支
 let lastSelectedBranch: string | undefined;
 
+// 创建一个包装函数来执行命令并确保进程清理
+async function executeCommand(command: string, options: ExecOptions, timeout: number = 30000): Promise<{ stdout: string; stderr: string }> {
+    return new Promise(async (resolve, reject) => {
+        let isCompleted = false;
+        
+        // 创建超时处理
+        const timeoutId = setTimeout(() => {
+            if (!isCompleted) {
+                isCompleted = true;
+                reject(new Error(`命令执行超时: ${command}`));
+            }
+        }, timeout);
+
+        try {
+            const process = exec(command, options, (error, stdout, stderr) => {
+                if (isCompleted) return;
+                
+                clearTimeout(timeoutId);
+                isCompleted = true;
+
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve({ stdout, stderr });
+                }
+            });
+
+            // 确保进程被清理
+            process.on('exit', (code) => {
+                if (!isCompleted) {
+                    clearTimeout(timeoutId);
+                    isCompleted = true;
+                    if (code === 0) {
+                        resolve({ stdout: '', stderr: '' });
+                    } else {
+                        reject(new Error(`进程退出，退出码: ${code}`));
+                    }
+                }
+            });
+
+            // 处理进程错误
+            process.on('error', (err) => {
+                if (!isCompleted) {
+                    clearTimeout(timeoutId);
+                    isCompleted = true;
+                    reject(err);
+                }
+            });
+        } catch (err) {
+            if (!isCompleted) {
+                clearTimeout(timeoutId);
+                isCompleted = true;
+                reject(err);
+            }
+        }
+    });
+}
+
 // 获取所有远程分支
 async function getRemoteBranches(workspaceFolder: vscode.WorkspaceFolder): Promise<string[]> {
-    const { stdout } = await execAsync('git branch -r', {
+    const { stdout } = await executeCommand('git branch -r', {
         cwd: workspaceFolder.uri.fsPath
     });
     
@@ -25,7 +83,7 @@ async function getRemoteBranches(workspaceFolder: vscode.WorkspaceFolder): Promi
 
 // 获取所有本地分支
 async function getLocalBranches(workspaceFolder: vscode.WorkspaceFolder): Promise<string[]> {
-    const { stdout } = await execAsync('git branch', {
+    const { stdout } = await executeCommand('git branch', {
         cwd: workspaceFolder.uri.fsPath
     });
     
@@ -50,7 +108,7 @@ async function getAvailableBranches(workspaceFolder: vscode.WorkspaceFolder): Pr
 // 检查分支是否存在于远程
 async function checkRemoteBranchExists(workspaceFolder: vscode.WorkspaceFolder, branch: string): Promise<boolean> {
     try {
-        const { stdout } = await execAsync('git branch -r', {
+        const { stdout } = await executeCommand('git branch -r', {
             cwd: workspaceFolder.uri.fsPath
         });
         return stdout.includes(`origin/${branch}`);
@@ -63,8 +121,6 @@ export function activate(context: vscode.ExtensionContext) {
     // 初始化输出通道
     outputChannel = vscode.window.createOutputChannel('Merge Branch Helper');
     outputChannel.clear();
-    outputChannel.show(true);
-    outputChannel.appendLine('Merge Branch Helper 插件已激活');
     
     // 从全局存储中获取上次选择的分支
     lastSelectedBranch = context.globalState.get<string>('lastSelectedBranch') || 'master';
@@ -100,11 +156,9 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            outputChannel.appendLine('正在检查是否为 Git 仓库...');
-            await execAsync('git rev-parse --git-dir', {
+            await executeCommand('git rev-parse --git-dir', {
                 cwd: workspaceFolder.uri.fsPath
             });
-            outputChannel.appendLine('检测到 Git 仓库，显示按钮');
             targetBranchItem.show();
             mergeButton.show();
         } catch (error) {
@@ -128,13 +182,12 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             // 获取当前分支
-            const { stdout: currentBranch } = await execAsync('git branch --show-current', {
+            const { stdout: currentBranch } = await executeCommand('git branch --show-current', {
                 cwd: workspaceFolder.uri.fsPath
             });
             const currentBranchName = currentBranch.trim();
 
             // 获取所有可用分支
-            outputChannel.appendLine('正在获取可用分支列表...');
             const branches = await getAvailableBranches(workspaceFolder);
             
             // 创建快速选择项
@@ -153,7 +206,6 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             if (!selected) {
-                outputChannel.appendLine('用户取消选择分支');
                 return;
             }
 
@@ -164,10 +216,9 @@ export function activate(context: vscode.ExtensionContext) {
             // 更新状态栏显示
             targetBranchItem.text = `$(git-branch) ${lastSelectedBranch}`;
             mergeButton.tooltip = `点击合并到 ${lastSelectedBranch}`;
-            
-            outputChannel.appendLine(`已将目标分支设置为: ${lastSelectedBranch}`);
         } catch (error: any) {
             outputChannel.appendLine(`错误: ${error.message}`);
+            outputChannel.show(true);
             vscode.window.showErrorMessage(`设置目标分支失败: ${error.message}`);
         }
     });
@@ -175,19 +226,16 @@ export function activate(context: vscode.ExtensionContext) {
     // 注册合并命令
     let mergeDisposable = vscode.commands.registerCommand('merge-branch-helper.mergeToBranch', async () => {
         try {
-            // 获取工作区
             const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
             if (!workspaceFolder) {
                 throw new Error('没有打开的工作区');
             }
 
             // 获取当前分支
-            outputChannel.appendLine('正在获取当前分支...');
-            const { stdout: currentBranch } = await execAsync('git branch --show-current', {
+            const { stdout: currentBranch } = await executeCommand('git branch --show-current', {
                 cwd: workspaceFolder.uri.fsPath
             });
             const currentBranchName = currentBranch.trim();
-            outputChannel.appendLine(`当前分支: ${currentBranchName}`);
 
             if (currentBranchName === lastSelectedBranch) {
                 throw new Error('不能合并到当前分支');
@@ -211,13 +259,11 @@ export function activate(context: vscode.ExtensionContext) {
             );
 
             if (answer !== '确定') {
-                outputChannel.appendLine('用户取消操作');
                 return;
             }
 
             // 检查是否有未提交的更改
-            outputChannel.appendLine('检查是否有未提交的更改...');
-            const { stdout: status } = await execAsync('git status --porcelain', {
+            const { stdout: status } = await executeCommand('git status --porcelain', {
                 cwd: workspaceFolder.uri.fsPath
             });
             if (status.trim()) {
@@ -229,52 +275,52 @@ export function activate(context: vscode.ExtensionContext) {
             mergeButton.tooltip = "正在进行合并操作";
 
             // 切换到目标分支
-            outputChannel.appendLine(`切换到目标分支 ${lastSelectedBranch}...`);
-            await execAsync(`git checkout ${lastSelectedBranch}`, {
+            await executeCommand(`git checkout ${lastSelectedBranch}`, {
                 cwd: workspaceFolder.uri.fsPath
             });
 
             // 拉取目标分支最新代码
             if (hasRemoteBranch) {
-                outputChannel.appendLine(`正在拉取 ${lastSelectedBranch} 分支的最新代码...`);
                 try {
-                    const { stdout: pullOutput } = await execAsync(`git pull origin ${lastSelectedBranch}`, {
+                    await executeCommand(`git pull origin ${lastSelectedBranch}`, {
                         cwd: workspaceFolder.uri.fsPath
                     });
-                    outputChannel.appendLine(`拉取结果: ${pullOutput.trim()}`);
                 } catch (pullError: any) {
                     // 如果拉取失败，切换回原分支并抛出错误
-                    await execAsync(`git checkout ${currentBranchName}`, {
+                    await executeCommand(`git checkout ${currentBranchName}`, {
                         cwd: workspaceFolder.uri.fsPath
                     });
+                    outputChannel.appendLine(`错误: 拉取最新代码失败: ${pullError.message}`);
+                    outputChannel.show(true);
                     throw new Error(`拉取最新代码失败: ${pullError.message}`);
                 }
-            } else {
-                outputChannel.appendLine(`目标分支 ${lastSelectedBranch} 在远程不存在，跳过拉取操作`);
             }
 
             // 合并当前分支
-            outputChannel.appendLine(`合并分支 ${currentBranchName}...`);
-            await execAsync(`git merge ${currentBranchName}`, {
-                cwd: workspaceFolder.uri.fsPath
-            });
-
-            // 推送到远程
-            outputChannel.appendLine(`推送到远程 ${lastSelectedBranch} 分支...`);
             try {
-                const { stdout: pushOutput } = await execAsync(`git push origin ${lastSelectedBranch}`, {
+                await executeCommand(`git merge ${currentBranchName}`, {
                     cwd: workspaceFolder.uri.fsPath
                 });
-                outputChannel.appendLine(`推送结果: ${pushOutput.trim()}`);
+            } catch (mergeError: any) {
+                outputChannel.appendLine(`错误: 合并失败: ${mergeError.message}`);
+                outputChannel.show(true);
+                throw new Error(`合并失败: ${mergeError.message}`);
+            }
+
+            // 推送到远程
+            try {
+                await executeCommand(`git push origin ${lastSelectedBranch}`, {
+                    cwd: workspaceFolder.uri.fsPath
+                });
             } catch (pushError: any) {
                 // 如果推送失败，提示用户但不中断操作
                 outputChannel.appendLine(`警告: 推送到远程失败: ${pushError.message}`);
+                outputChannel.show(true);
                 vscode.window.showWarningMessage(`合并成功，但推送到远程失败: ${pushError.message}`);
             }
 
             // 切换回原分支
-            outputChannel.appendLine(`切换回分支 ${currentBranchName}...`);
-            await execAsync(`git checkout ${currentBranchName}`, {
+            await executeCommand(`git checkout ${currentBranchName}`, {
                 cwd: workspaceFolder.uri.fsPath
             });
 
@@ -282,21 +328,21 @@ export function activate(context: vscode.ExtensionContext) {
             mergeButton.text = "$(git-merge) 合并";
             mergeButton.tooltip = `点击合并到 ${lastSelectedBranch}`;
 
-            outputChannel.appendLine('合并操作完成');
-            vscode.window.showInformationMessage(`成功将 ${currentBranchName} 合并到 ${lastSelectedBranch} 并推送到远程`);
+            // 只显示成功提示，不显示输出
+            vscode.window.showInformationMessage(`成功将 ${currentBranchName} 合并到 ${lastSelectedBranch}`);
         } catch (error: any) {
             // 恢复状态栏显示
             mergeButton.text = "$(git-merge) 合并";
             mergeButton.tooltip = `点击合并到 ${lastSelectedBranch}`;
             
             outputChannel.appendLine(`错误: ${error.message}`);
+            outputChannel.show(true);
             vscode.window.showErrorMessage(`操作失败: ${error.message}`);
         }
     });
 
     // 监听工作区变化
     const workspaceWatcher = vscode.workspace.onDidChangeWorkspaceFolders(() => {
-        outputChannel.appendLine('工作区发生变化，重新检查 Git 仓库状态');
         checkGitRepository();
     });
 
